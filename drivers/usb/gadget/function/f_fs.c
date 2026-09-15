@@ -128,9 +128,10 @@ struct ffs_ep {
 struct ffs_epfile {
 	/* Protects ep->ep and ep->req. */
 	struct mutex			mutex;
-	atomic_t			error;
+
 	struct ffs_data			*ffs;
 	struct ffs_ep			*ep;	/* P: ffs->eps_lock */
+	atomic_t			opened;
 
 	struct dentry			*dentry;
 
@@ -197,7 +198,7 @@ struct ffs_epfile {
 	unsigned char			in;	/* P: ffs->eps_lock */
 	unsigned char			isoc;	/* P: ffs->eps_lock */
 
-	unsigned char			_pad;
+	bool				invalid;
 };
 
 struct ffs_buffer {
@@ -895,10 +896,6 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 	char *data = NULL;
 	ssize_t ret, data_len = -EINVAL;
 	int halt;
-	/* to get updated error atomic variable value */
-	smp_mb__before_atomic();
-	if (atomic_read(&epfile->error))
-		return -ENODEV;
 
 	/* Are we still active? */
 	if (WARN_ON(epfile->ffs->state != FFS_ACTIVE))
@@ -909,24 +906,21 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 	if (!ep) {
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		/* Don't wait on write if device is offline */
-		if (!io_data->read)
-			return -ENODEV;
-		/* to get updated error atomic variable value */
-		smp_mb__before_atomic();
 
 		/*
-		 * if ep is disabled, this fails all current IOs
-		 * and wait for next epfile open to happen
+		 * epfile->invalid is set when EPs are disabled. Userspace
+		 * might have stale threads continuing to do I/O and may be
+		 * unaware of that especially if we block here. Instead return
+		 * an error immediately here and don't allow any more I/O
+		 * until the epfile is reopened.
 		 */
-		if (!atomic_read(&epfile->error)) {
-			ret = wait_event_interruptible(
-				epfile->ffs->wait, (ep = epfile->ep));
-			if (ret)
-				return -EINTR;
-		}
-		if (!ep)
+		if (epfile->invalid)
 			return -ENODEV;
+
+		ret = wait_event_interruptible(
+				epfile->ffs->wait, (ep = epfile->ep));
+		if (ret)
+			return -EINTR;
 	}
 
 	/* Do we halt? */
@@ -1037,25 +1031,42 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 			 * status. usb_ep_dequeue API should guarantee no race
 			 * condition with req->complete callback.
 			 */
-			usb_ep_dequeue(ep->ep, req);
-			wait_for_completion(&done);
-			interrupted = ep->status < 0;
+			spin_lock_irq(&epfile->ffs->eps_lock);
+			interrupted = true;
+			/*
+			 * While we were acquiring lock endpoint got
+			 * disabled (disconnect) or changed
+			 * (composition switch) ?
+			 */
+			if (epfile->ep == ep) {
+				usb_ep_dequeue(ep->ep, req);
+				spin_unlock_irq(&epfile->ffs->eps_lock);
+				wait_for_completion(&done);
+				interrupted = ep->status < 0;
+			} else {
+				spin_unlock_irq(&epfile->ffs->eps_lock);
+			}
 		}
 
-		if (interrupted)
+		if (interrupted) {
 			ret = -EINTR;
-		else if (io_data->read && ep->status > 0) {
-			if (ep->status > 0xFFFFFF) {
-				pr_info("%s abnormal size=%d\n",
-						__func__, (int)ep->status);
-				ret = -ENOMEM;
-				goto error_mutex;
-			}
+			goto error_mutex;
+		}
+
+		ret = -ENODEV;
+		spin_lock_irq(&epfile->ffs->eps_lock);
+		/*
+		 * While we were acquiring lock endpoint got
+		 * disabled (disconnect) or changed
+		 * (composition switch) ?
+		 */
+		if (epfile->ep == ep) {
+			ret = ep->status;
+		}
+		spin_unlock_irq(&epfile->ffs->eps_lock);
+		if (io_data->read && ret > 0)
 			ret = __ffs_epfile_read_data(epfile, data, ep->status,
 						     &io_data->data);
-		}
-		else
-			ret = ep->status;
 		goto error_mutex;
 	} else if (!(req = usb_ep_alloc_request(ep->ep, GFP_ATOMIC))) {
 		ret = -ENOMEM;
@@ -1107,9 +1118,7 @@ ffs_epfile_open(struct inode *inode, struct file *file)
 
 	file->private_data = epfile;
 	ffs_data_opened(epfile->ffs);
-	/* to get updated opened atomic variable value */
-	smp_mb__before_atomic();
-	atomic_set(&epfile->error, 0);
+	atomic_inc(&epfile->opened);
 
 	return stream_open(inode, file);
 }
@@ -1229,7 +1238,10 @@ ffs_epfile_release(struct inode *inode, struct file *file)
 	ENTER();
 
 	__ffs_epfile_read_buffer_free(epfile);
-	atomic_set(&epfile->error, 1);
+
+	if (atomic_dec_and_test(&epfile->opened))
+		epfile->invalid = false;
+
 	ffs_data_closed(epfile->ffs);
 
 	return 0;
@@ -1911,10 +1923,10 @@ static void ffs_func_eps_disable(struct ffs_function *func)
 	count = func->ffs->eps_count;
 	epfile = func->ffs->epfiles;
 	ep = func->eps;
-	do {
+	while (count--) {
 
 		if (epfile)
-			atomic_set(&epfile->error, 1);
+			epfile->invalid = true; /* until file is reopened */
 
 		/* pending requests get nuked */
 		if (likely(ep->ep))
@@ -1926,7 +1938,7 @@ static void ffs_func_eps_disable(struct ffs_function *func)
 			__ffs_epfile_read_buffer_free(epfile);
 			++epfile;
 		}
-	} while (--count);
+	}
 	spin_unlock_irqrestore(&func->ffs->eps_lock, flags);
 }
 
@@ -3245,8 +3257,10 @@ static int ffs_func_set_alt(struct usb_function *f,
 			return intf;
 	}
 
-	if (ffs->func)
+	if (ffs->func) {
 		ffs_func_eps_disable(ffs->func);
+		ffs->func = NULL;
+	}
 
 	if (ffs->state == FFS_DEACTIVATED) {
 		ffs->state = FFS_CLOSING;
@@ -3341,6 +3355,9 @@ static bool ffs_func_req_match(struct usb_function *f,
 			       bool config0)
 {
 	struct ffs_function *func = ffs_func_from_usb(f);
+
+	if (!test_bit(FFS_FL_BOUND, &func->ffs->flags))
+		return false;
 
 	if (config0 && !(func->ffs->user_flags & FUNCTIONFS_CONFIG0_SETUP))
 		return false;
