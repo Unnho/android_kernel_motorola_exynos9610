@@ -183,7 +183,7 @@ static void init_sink_cap_data(struct usbpd_manager_data *_data)
 	msg_header->port_data_role = USBPD_UFP;
 	msg_header->spec_revision = 1;
 	msg_header->port_power_role = USBPD_SINK;
-	msg_header->num_data_objs = 1;
+	msg_header->num_data_objs = 2;
 
 	data_obj->power_data_obj_sink.supply_type = POWER_TYPE_FIXED;
 	data_obj->power_data_obj_sink.dual_role_power = 1;
@@ -193,12 +193,10 @@ static void init_sink_cap_data(struct usbpd_manager_data *_data)
 	data_obj->power_data_obj_sink.data_role_swap = 1;
 	data_obj->power_data_obj_sink.voltage = 5000/50;
 	data_obj->power_data_obj_sink.op_current = 3000/10;
-#if 0
 	(data_obj + 1)->power_data_obj_variable.supply_type = POWER_TYPE_VARIABLE;
 	(data_obj + 1)->power_data_obj_variable.max_voltage = _data->sink_cap_max_volt / 50;
 	(data_obj + 1)->power_data_obj_variable.min_voltage = 5000 / 50;
 	(data_obj + 1)->power_data_obj_variable.max_current = 3000 / 10;
-#endif
 }
 
 void usbpd_manager_receive_samsung_uvdm_message(struct usbpd_data *pd_data)
@@ -1064,7 +1062,7 @@ static int of_usbpd_manager_dt(struct usbpd_manager_data *_data)
 		ret = of_property_read_u32(np, "sink,capable_max_voltage",
 				&_data->sink_cap_max_volt);
 		if (ret < 0) {
-			_data->sink_cap_max_volt = 5000;
+			_data->sink_cap_max_volt = 9000;
 			pr_err("%s error reading sink_cap_max_volt %d\n",
 					__func__, _data->sink_cap_max_volt);
 		}
